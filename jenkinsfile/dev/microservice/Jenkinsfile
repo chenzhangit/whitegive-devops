@@ -1,0 +1,129 @@
+import com.whitegive.devops.kubernetes.KpayJavaDeployment
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+@Library('whitegive-devops') _
+
+def kpayJavaDeployment = new KpayJavaDeployment()
+
+pipeline {
+    // 声明Jenkins节点
+    agent { label 'master' }
+
+    // 每个阶段运行结束时的操作
+    options {
+        /*
+            LogRotator构造参数分别为：
+            daysToKeep: 构建记录将保存的天数
+            numToKeep: 最多此数目的构建记录将被保存
+            artifactDaysToKeep: 比此早的发布包将被删除，但构建的日志、操作历史、报告等将被保留
+            artifactNumToKeep: 最多此数目的构建将保留他们的发布包
+         */
+        buildDiscarder(logRotator(numToKeepStr: '15', artifactDaysToKeepStr: '15', daysToKeepStr: '90'))
+        // 构建超时时间
+        timeout(time: 15, unit: 'MINUTES')
+        // 不允许同时执行流水线。 可被用来防止同时访问共享资源等
+        disableConcurrentBuilds()
+    }
+
+    // 構建觸發器
+    triggers {
+        GenericTrigger(
+                genericVariables: [
+                        [key: 'git_project_name', value: '$.project.name'],
+                        [key: 'branch', value: '$.ref'],
+                        [key: 'base_branch', value: '$.ref', regexpFilter: 'refs/heads'],
+                        [key: 'user_name', value: '$.user_name'],
+                        [key: 'commits', value: '$.commits'],
+                ],
+                token: 'kpay-microservice',
+                causeString: ' Triggered on $branch',
+                printContributedVariables: false,
+                printPostContent: false,
+                silentResponse: false,
+                regexpFilterText: '$git_project_name$base_branch',
+                regexpFilterExpression: JOB_NAME
+        )
+    }
+
+    // 声明变量
+    environment {
+        SERVER_NAME = ""
+        POM_VERSION = ""
+        BUILD_ENV = ""
+        REPOSITORY_URI = ""
+        REPOSITORY_REGION = ""
+        IMAGE_BUILD_ID = ""
+        KUBOARD_URI = ""
+        KUBOARD_USERNAME = ""
+        KUBOARD_ACCESS_KEY = ""
+        KUBOARD_CLUSTER = ""
+        KUBOARD_NAME_SPACE = ""
+        USERNAME = "手动触发"
+        NEED_DEPLOY = false
+    }
+
+    // 声明自定义变量
+    parameters {
+        booleanParam(name: 'SNAPSHOT_DEPLOY', defaultValue: false, description: '选择是否需要构建快照包')
+    }
+
+    stages {
+
+        stage('匹配构建环境') {
+            agent {
+                label 'slave'
+            }
+            steps {
+                script {
+                    def pom = readMavenPom file: 'pom.xml'
+                    SERVER_NAME = pom.artifactId
+                    POM_VERSION = pom.version
+
+                    def config = KpayEnvConfig.getJavaEnvConfig(SERVER_NAME, JOB_BASE_NAME)
+
+                    BUILD_ENV = config.getBuildEnv()
+                    REPOSITORY_URI = config.getRepositoryUri()
+                    REPOSITORY_REGION = config.getRepositoryRegion()
+                    KUBOARD_URI = config.getKuboardUri()
+                    KUBOARD_USERNAME = config.getKuboardUsername()
+                    KUBOARD_ACCESS_KEY = config.getKuboardAccessKey()
+                    KUBOARD_CLUSTER = config.getKuboardCluster()
+                    KUBOARD_NAME_SPACE = config.getKuboardNameSpace()
+
+                    IMAGE_BUILD_ID = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmm"))
+
+                    echo "[ BUILD_ENV: ${BUILD_ENV}, REPOSITORY_URI: ${REPOSITORY_URI}, KUBOARD_URI: ${KUBOARD_URI}, KUBOARD_CLUSTER: ${KUBOARD_CLUSTER}, KUBOARD_NAME_SPACE: ${KUBOARD_NAME_SPACE} ]"
+                }
+            }
+        }
+
+        stage('开发环境应用构建') {
+            agent {
+                label 'kpaydev'
+            }
+            when {
+                beforeAgent true
+                expression {
+                    BUILD_ENV == "dev"
+                }
+            }
+            steps {
+                script {
+                    echo "[ 代码打包 ]"
+                    kpayJavaDeployment.buildCode(BUILD_ENV)
+
+                    echo "[ 镜像打包 ]"
+                    kpayJavaDeployment.buildDockerImage(KUBOARD_NAME_SPACE, SERVER_NAME, POM_VERSION, IMAGE_BUILD_ID, REPOSITORY_REGION, REPOSITORY_URI, BUILD_ENV)
+
+                    echo "[ 镜像推送 ]"
+                    kpayJavaDeployment.pushDockerImage(KUBOARD_NAME_SPACE, SERVER_NAME, POM_VERSION, IMAGE_BUILD_ID, REPOSITORY_URI)
+
+                    echo "[ 更新Deployment ]"
+                    kpayJavaDeployment.updateDeployment(KUBOARD_USERNAME, KUBOARD_ACCESS_KEY, KUBOARD_CLUSTER, KUBOARD_NAME_SPACE, SERVER_NAME, POM_VERSION, IMAGE_BUILD_ID, REPOSITORY_URI, KUBOARD_URI)
+                }
+            }
+        }
+
+    }
+}
